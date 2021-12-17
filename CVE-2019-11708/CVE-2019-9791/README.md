@@ -1,0 +1,11 @@
+# Exploit chain for CVE-2019-9791 & CVE-2019-11708 against Firefox 65.0 
+
+Works against Firefox 65.0 on windows 64bit.  CVE-2019-11708 part is taken from exploit by 0vercl0k:
+
+https://github.com/0vercl0k/CVE-2019-11708
+
+The exploit uses CVE-2019-9791 to obtain read/write primitive in content process then CVE-2019-11708 to make the main process load arbitrary url. In parent process  CVE-2019-9791 is used again to obtain arbitrary code execution.
+
+
+
+![](demo.gif)
